@@ -1,0 +1,15 @@
+--- #YAML:1.0
+name:                WWW-Omegle
+version:             0.01
+abstract:            Perl interface www.omegle.com
+license:             ~
+author:              
+    - Mischa Spiegelmock <revmischa@cpan.org>
+generated_by:        ExtUtils::MakeMaker version 6.42
+distribution_type:   module
+requires:     
+    JSON:                          
+    WWW::Mechanize:                
+meta-spec:
+    url:     http://module-build.sourceforge.net/META-spec-v1.3.html
+    version: 1.3
