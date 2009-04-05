@@ -6,9 +6,13 @@ use warnings;
 
 use Carp qw/croak/;
 use JSON;
-use parent 'WWW::Mechanize';
 
-our $VERSION = '0.01';
+use base qw/WWW::Mechanize/;
+use HTTP::Async;
+use HTTP::Request;
+use HTTP::Request::Common;
+
+our $VERSION = '0.02';
 
 sub new {
     my ($class, %opts) = @_;
@@ -25,7 +29,11 @@ sub new {
         disconnect => $disconnect_cb,
     };
 
+    my $async = new HTTP::Async();
+    $self->{async} = $async;
+
     bless $self, $class;
+
     return $self;
 }
 
@@ -40,25 +48,55 @@ sub start {
     return undef unless $id;
 
     $self->{om_id} = $id;
+
+    $self->handle_event($res);
+    $self->request_next_event;
+
     return $id;
 }
 
-sub om_callback {
-    my ($self, $callback, @extra) = @_;
+sub callback {
+    my ($self, $action, @args) = @_;
     
-    $callback = $self->{om_callbacks}->{$callback}
+    my $callback = $self->{om_callbacks}->{$action}
         or return;
 
-    $callback->($self, @extra);
+    my $extra = $self->{om_callback_userdata}->{$action} || [];
+    $callback->($self, @args, @$extra);
 }
 
-sub get_next_event {
-    my ($self) = @_;
+sub set_callback {
+    my ($self, $action, $cb, @extra) = @_;
 
-    return undef unless $self->{om_id};
+    $self->{om_callback_userdata}->{$action} = \@extra;
+    $self->{om_callbacks}->{$action} = $cb;
+}
 
-    my $res = $self->post("http://omegle.com/events", { id => $self->{om_id} });
-    return undef unless $res->is_success;
+# process a HTTP::Response from /events. parse JSON and dispatch to callbacks
+sub handle_event {
+    my ($self, $res) = @_;
+
+    unless ($res->is_success) {
+        $self->callback('error', $res->status_line);
+        warn "HTTP error: " . $res->status_line;
+        return;
+    }
+
+    return undef unless $res->content;
+
+    unless ($res->content =~ /^\[/) {
+        if ($res->content eq 'win') {
+            # yay, message delivered OK
+            return;
+        } elsif ($res->content =~ /^"/) { # " ){  # emacs :(
+            # got id
+            return;
+        } else {
+            # not JSON array of events
+            $self->callback(error => "Got invalid JSON: " . $res->content);
+            return;
+        }
+    }
     
     my $json = new JSON;
     my $events = $json->decode($res->content)
@@ -70,11 +108,11 @@ sub get_next_event {
         my $evt_name = $evt->[0]
             or next;
         if ($evt_name eq 'connected') {
-            $self->om_callback('connect');
+            $self->callback('connect');
         } elsif ($evt_name eq 'gotMessage') {
-            $self->om_callback('chat', $evt->[1]);
+            $self->callback('chat', $evt->[1]);
         } elsif ($evt_name eq 'strangerDisconnected') {
-            $self->om_callback('disconnect');
+            $self->callback('disconnect');
             delete $self->{om_id};
         } elsif ($evt_name eq 'waiting') {
             
@@ -83,35 +121,84 @@ sub get_next_event {
         }
     }
 
-    return $events;
+    $self->callback('event_handled', 1);
+
+    return 1;
+}
+
+# event loop, currently runs forever.
+sub run_event_loop {
+    my ($self) = @_;
+
+    my $done;
+    while (! $done) {
+        my $res = $self->wait_next_event;
+        next unless $res;
+
+        $self->handle_event($res);
+        $self->request_next_event;
+    }
+}
+
+# block and wait for next omegle event
+sub wait_next_event {
+    my ($self, $wait_for) = @_;
+    $wait_for ||= 0.5;
+    return $self->{async}->wait_for_next_response($wait_for);
+}
+
+# let async http worker do some work, and flush event queue
+sub poke {
+    my $self = shift;
+
+    $self->{async}->poke;
+    $self->flush_events;
+}
+
+# process all http responses in the queue
+sub flush_events {
+    my $self = shift;
+
+    my $got_events = 0;
+
+    while ($self->{async}->not_empty) {
+        if (my $response = $self->{async}->next_response) {
+            $self->handle_event($response);
+            $got_events = 1;
+        } else {
+            last;
+        }
+    }
+
+    # got some events, should ask for more
+    $self->request_next_event if $got_events;
+}
+
+# post an asynchronous http request asking omegle for the next event.
+# this may take a long time to complete
+sub request_next_event {
+    my ($self) = @_;
+
+    return undef unless $self->{om_id};
+    $self->{async}->add(POST "http://omegle.com/events", [ id => $self->{om_id} ]);
 }
 
 sub say {
     my ($self, $what) = @_;
 
     return undef unless $self->{om_id};
-
-    my $res = $self->post("http://omegle.com/send", {
-        id  => $self->{om_id},
-        msg => $what,
-    });
-
-    return $res->is_success;
+    $self->{async}->add(POST "http://omegle.com/send", [ id => $self->{om_id}, msg => $what ]);
 }
 
 sub disconnect {
     my ($self) = @_;
 
     return undef unless $self->{om_id};
-
-    my $res = $self->post("http://omegle.com/disconnect", {
-        id  => $self->{om_id},
-    });
-
-    return $res->is_success;
+    $self->{async}->add(POST "http://omegle.com/disconnect", [ id => $self->{om_id} ]);
 }    
 
 1;
+
 
 __END__
 
@@ -136,7 +223,7 @@ WWW::Omegle - Perl interface www.omegle.com
   sub connect_cb {
     my ($om) = @_;
     print "Connected\n";
-    $om->say('u sux');
+    $om->say('Hello, sir!');
   }
 
   sub chat_cb {
@@ -173,6 +260,11 @@ on_chat, on_disconnect and on_connect, which must be coderefs. See
 synopsis for usage examples.
 Other %opts are passed to the WWW::Mechanize constructor
 
+=item set_callback($action, $callback, @userdata)
+
+Sets the callback for $action, where $action is 'connect, 'chat' or 'disconnect'.
+@userdata is user-supplied opaque data that will be bassed to the callback.
+
 =item start
 
 Begins a chat with a random stranger. Returns success/failure.
@@ -188,7 +280,16 @@ Terminates your conversation.
 =item get_next_event
 
 Fetches the next event and dispatches to the appropriate callback. See
-synopsis.
+synopsis. This method will block while waiting for the next event.
+
+=item run_event_loop
+
+Sit and process events forever. Only useful for simple, callback-based scripts
+
+=item poke
+
+Check for events that have been received and flush event queue.
+Call this method frequently in your main loop if you are not using run_event_loop()
 
 =back
 
